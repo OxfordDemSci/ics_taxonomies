@@ -80,9 +80,15 @@ def _norm_text(s: str) -> str:
     s = RE_PAGE.sub("\n", s)
     return re.sub(r"\n{3,}", "\n\n", s)
 
+# Original specific patterns kept (but not relied upon for start detection)
 PAT_NAMES   = re.compile(r"Name\(s\)\s*:", flags=re.I)
 PAT_ROLES   = re.compile(r"Role\(s\)\s*(?:\(\s*e\.?g\.?\s*job\s*title\s*\))?\s*:", flags=re.I)
 PAT_PERIODS = re.compile(r"Period\(s\)\s*employed\s*by\s*[\s\S]*?submitting\s*HEI\s*:", flags=re.I)
+
+# Generalised start-of-line headings: match 'name*:', 'role*:', 'period*:'
+PAT_START_NAME   = re.compile(r"^\s*name.*?:", flags=re.I | re.M)
+PAT_START_ROLE   = re.compile(r"^\s*role.*?:", flags=re.I | re.M)
+PAT_START_PERIOD = re.compile(r"^\s*period.*?:", flags=re.I | re.M)
 
 NEXT_SECTION_MARKERS = [
     re.compile(r"^\s*Period\s*when\s*the\s*claimed\s*impact\s*occurred\s*:", re.I | re.M),
@@ -93,22 +99,54 @@ NEXT_SECTION_MARKERS = [
 ]
 
 def isolate_staff_names_block(text: str) -> Optional[str]:
+    """
+    Generalised block extraction:
+    Start the block at the earliest of a line beginning with 'name*:', 'role*:', or 'period*:' (case-insensitive),
+    allowing arbitrary characters between the keyword and the colon. Normalise headings within the block to:
+      - 'Name(s):'
+      - 'Role(s):'
+      - 'Period(s) employed by submitting HEI:'
+    """
     txt = _norm_text(text)
-    if not txt: return None
-    m_start = PAT_NAMES.search(txt)
-    if not m_start: return None
-    start = m_start.start()
+    if not txt:
+        return None
+
+    # Find earliest start among the three headings
+    starts = []
+    for pat in (PAT_START_NAME, PAT_START_ROLE, PAT_START_PERIOD):
+        m = pat.search(txt)
+        if m:
+            starts.append(m.start())
+    if not starts:
+        return None
+    start = min(starts)
+
+    # Determine end using next-section markers
     next_hits = [pat.search(txt, pos=start) for pat in NEXT_SECTION_MARKERS]
     ends = [m.start() for m in next_hits if m]
     end = min(ends) if ends else len(txt)
+
     block = txt[start:end].strip()
-    if not block: return None
+    if not block:
+        return None
+
+    # Normalise headings to canonical labels, only when they begin a line
+    def _sub_heading(pattern: re.Pattern, replacement: str, s: str) -> str:
+        return re.sub(pattern, replacement, s)
+
+    block = _sub_heading(PAT_START_NAME,   "Name(s):", block)
+    block = _sub_heading(PAT_START_ROLE,   "Role(s):", block)
+    block = _sub_heading(PAT_START_PERIOD, "Period(s) employed by submitting HEI:", block)
+
+    # Also normalise any legacy specific patterns to the canonical labels (idempotent)
     block = PAT_NAMES.sub("Name(s):", block)
     block = PAT_ROLES.sub("Role(s):", block)
     block = PAT_PERIODS.sub("Period(s) employed by submitting HEI:", block)
+
     paras = [RE_MULTI_SPACE.sub(" ", " ".join(p.strip() for p in para.splitlines())).strip()
              for para in re.split(r"(?:\n\s*){2,}", block)]
-    return "\n\n".join(p for p in paras if p)
+    block = "\n\n".join(p for p in paras if p)
+    return block or None
 
 # =========================
 # 3) NAME NORMALISATION
@@ -184,11 +222,12 @@ _STAFF_TOOL = {
     }
 }
 
-def parse_staff_with_llm(block_text: str, model: str = "gpt-4o") -> List[Dict[str, Any]]:
+def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str, Any]]:
     if not isinstance(block_text, str) or not block_text.strip():
         return []
     resp = client.chat.completions.create(
         model=model,
+        service_tier="flex",
         messages=[{"role": "system", "content": _SYSTEM_MSG},
                   {"role": "user", "content": block_text}],
         tools=[_STAFF_TOOL],
@@ -236,7 +275,7 @@ def get_staff_rows(
     input_csv_path="../data/final/enhanced_ref_data.csv",
     out_dir="../data/ics_staff_rows",
     base_url="https://results2021.ref.ac.uk/impact",
-    model_staff="gpt-4o",
+    model_staff="gpt-5",
     sleep_between_calls=0.03
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     os.makedirs(out_dir, exist_ok=True)
@@ -245,7 +284,7 @@ def get_staff_rows(
     ids = df_ids["REF impact case study identifier"].astype(str).tolist()
 
     all_texts = {}
-    for ics in tqdm(ids[0:30], desc="Downloading & extracting PDFs"):
+    for ics in tqdm(ids, desc="Downloading & extracting PDFs"):
         target = f"{base_url}/{ics}/pdf"
         try:
             r = requests.get(target, timeout=60)
@@ -259,20 +298,35 @@ def get_staff_rows(
                             columns=["REF impact case study identifier", "Extracted Text"])
     df_texts.to_csv(os.path.join(out_dir, "ref_case_studies_text.csv"), index=False)
 
+    # Compute staff blocks for all rows (do NOT drop rows with no block)
     df_staff_blocks = (
         df_texts.assign(staff_block=lambda d: d["Extracted Text"].apply(isolate_staff_names_block))
-                .dropna(subset=["staff_block"])
                 .reset_index(drop=True)
     )
     df_staff_blocks.to_csv(os.path.join(out_dir, "staff_blocks.csv"), index=False)
 
     records: List[Dict[str, Any]] = []
+    # Iterate over ALL rows, writing a row of NaNs if nothing is extracted
     for _, r in tqdm(df_staff_blocks.iterrows(), total=len(df_staff_blocks), desc="Extracting staff with LLM"):
         ics_id, block = r["REF impact case study identifier"], r["staff_block"]
-        try:
-            people = parse_staff_with_llm(block, model=model_staff)
-        except Exception as e:
-            people = [{"name": None, "roles": [], "error": str(e)}]
+        people: List[Dict[str, Any]] = []
+        if isinstance(block, str) and block.strip():
+            try:
+                people = parse_staff_with_llm(block, model=model_staff)
+            except Exception as e:
+                people = [{"name": None, "roles": [], "error": str(e)}]
+
+        # If nothing extracted, still write a placeholder row of NaNs to preserve row counts
+        if not people:
+            records.append({
+                "REF impact case study identifier": ics_id,
+                "name": pd.NA,
+                "name_no_titles": pd.NA,
+                "given_name": pd.NA,
+                "role": pd.NA
+            })
+            time.sleep(sleep_between_calls)
+            continue
 
         for person in people:
             raw_name = (person.get("name") or "").strip()
@@ -282,10 +336,10 @@ def get_staff_rows(
             roles = [x.strip() for x in (person.get("roles") or []) if x.strip()]
             records.append({
                 "REF impact case study identifier": ics_id,
-                "name": name_norm or None,
-                "name_no_titles": name_no_titles or None,
-                "given_name": given_name or None,
-                "role": "; ".join(roles) if roles else None
+                "name": name_norm or pd.NA,
+                "name_no_titles": name_no_titles or pd.NA,
+                "given_name": given_name or pd.NA,
+                "role": "; ".join(roles) if roles else pd.NA
             })
         time.sleep(sleep_between_calls)
 
@@ -293,10 +347,10 @@ def get_staff_rows(
     df_staff_rows["offline_gender"] = df_staff_rows["given_name"].apply(infer_gender_offline)
     df_staff_rows.to_csv(os.path.join(out_dir, "ref_staff_rows.csv"), index=False)
 
-    # Aggregate
-    df = df_staff_rows.copy().fillna("")
+    # Aggregate (preserve NaNs; do not fill with empty strings)
+    df = df_staff_rows.copy()
     grouped = (
-        df.groupby("REF impact case study identifier")
+        df.groupby("REF impact case study identifier", dropna=False)
           .agg(
               names=("name", list),
               given_names=("given_name", list),
@@ -305,7 +359,7 @@ def get_staff_rows(
           )
     )
     counts = (
-        df.groupby("REF impact case study identifier")["offline_gender"]
+        df.groupby("REF impact case study identifier", dropna=False)["offline_gender"]
           .value_counts().unstack(fill_value=0)
           .rename(columns={
               "male": "number_male",
@@ -313,6 +367,11 @@ def get_staff_rows(
               "unknown": "number_unknown"
           })
     )
+    # Ensure expected columns exist even if missing in the data
+    for col in ("number_male", "number_female", "number_unknown"):
+        if col not in counts.columns:
+            counts[col] = 0
+
     ref_case_level = grouped.join(counts, how="left").fillna(0).reset_index()
     ref_case_level["number_people"] = (
         ref_case_level[["number_male", "number_female", "number_unknown"]].sum(axis=1).astype(int)
@@ -323,6 +382,18 @@ def get_staff_rows(
         "number_people", "number_male", "number_female", "number_unknown"
     ]]
     ref_case_level.to_csv(os.path.join(out_dir, "ref_case_level.csv"), index=False)
+
+    # Assert that output row counts align with the original number of rows
+    n_original = len(df_ids)
+    n_unique_staff_rows = df_staff_rows["REF impact case study identifier"].nunique()
+    n_case_level = len(ref_case_level)
+    assert n_unique_staff_rows == n_original, (
+        f"Mismatch: unique staff rows ({n_unique_staff_rows}) != original rows ({n_original})"
+    )
+    assert n_case_level == n_original, (
+        f"Mismatch: aggregated case rows ({n_case_level}) != original rows ({n_original})"
+    )
+
     return df_staff_rows, ref_case_level
 
 if __name__ == "__main__":
