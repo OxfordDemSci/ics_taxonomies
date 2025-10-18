@@ -1,17 +1,25 @@
 # ref_staff.py
 # -*- coding: utf-8 -*-
 """
-REF staff extraction pipeline with always-on OpenAI integration.
+REF staff extraction pipeline with OpenAI integration.
 
 Reads the API key from:  ../keys/OPENAI_API_KEY
 Requires:
-    - pandas, requests, tqdm, pdfminer.six
+    - pandas, requests, tqdm, pdfminer.six, PyMuPDF (fitz)
     - openai
     - gender-guesser
 """
 
 from __future__ import annotations
-import io, os, re, json, time, logging, requests, pandas as pd
+
+import io
+import os
+import re
+import json
+import time
+import logging
+import requests
+import pandas as pd
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 from openai import OpenAI
@@ -26,7 +34,7 @@ def _load_openai_client() -> OpenAI:
         raise FileNotFoundError(f"OpenAI key not found at {key_path}")
     with open(key_path, "r", encoding="utf-8") as f:
         key = f.read().strip()
-    if not key.startswith("sk-") and not key.startswith("proj-") and not key.startswith("sk-proj-"):
+    if not (key.startswith("sk-") or key.startswith("proj-") or key.startswith("sk-proj-")):
         raise ValueError("The file ../keys/OPENAI_API_KEY does not contain a valid OpenAI API key.")
     return OpenAI(api_key=key)
 
@@ -68,85 +76,129 @@ def extract_text_safe(pdf_bytes: bytes) -> str:
 # 2) STAFF BLOCK ISOLATION
 # =========================
 
-DASHES = "\u2010\u2011\u2012\u2013\u2014\u2212"
+DASHES = "\u2010\u2011\u2012\u2013\u2014\u2212"  # hyphen, non-breaking hyphen, figure dash, en/em dash, minus
 RE_DASHES      = re.compile(f"[{DASHES}]")
 RE_PAGE        = re.compile(r"\n?Page\s+\d+\s*\n", flags=re.I)
 RE_MULTI_SPACE = re.compile(r"[ \t]+")
 
 def _norm_text(s: str) -> str:
-    if not isinstance(s, str) or not s.strip(): return ""
+    if not isinstance(s, str) or not s.strip():
+        return ""
     s = s.replace("\r", "")
     s = RE_DASHES.sub("-", s)
     s = RE_PAGE.sub("\n", s)
     return re.sub(r"\n{3,}", "\n\n", s)
 
-# Original specific patterns kept (but not relied upon for start detection)
-PAT_NAMES   = re.compile(r"Name\(s\)\s*:", flags=re.I)
-PAT_ROLES   = re.compile(r"Role\(s\)\s*(?:\(\s*e\.?g\.?\s*job\s*title\s*\))?\s*:", flags=re.I)
-PAT_PERIODS = re.compile(r"Period\(s\)\s*employed\s*by\s*[\s\S]*?submitting\s*HEI\s*:", flags=re.I)
+# Header punctuation set
+_PUNCT = r"[:\-–—\uFF1A]"
 
-# Generalised start-of-line headings: match 'name*:', 'role*:', 'period*:'
-PAT_START_NAME   = re.compile(r"^\s*name.*?:", flags=re.I | re.M)
-PAT_START_ROLE   = re.compile(r"^\s*role.*?:", flags=re.I | re.M)
-PAT_START_PERIOD = re.compile(r"^\s*period.*?:", flags=re.I | re.M)
+# -------- Strict header variants (robust but expect punctuation) --------
+PAT_NAMES_STRICT   = re.compile(rf"(?mi)^\s*Name(?:\s*\(\s*s\s*\))?s?\s*{_PUNCT}")
+PAT_ROLES_STRICT   = re.compile(
+    rf"(?mi)^\s*(?:Role|Position|Job\s*title)(?:\s*\(\s*s\s*\))?s?"
+    rf"(?:\s*\(\s*e\.?\s*g\.?\s*job\s*title\s*\))?\s*{_PUNCT}"
+)
+PAT_PERIODS_STRICT = re.compile(
+    rf"(?mi)^\s*(?:Period|Date|Dates|Employment\s*period)(?:\s*\(\s*s\s*\))?s?"
+    rf"(?:\s+(?:employed|of\s*employment|in\s*post))?"
+    rf"(?:[^\n]{{0,200}})?\s*{_PUNCT}"
+)
 
+# -------- Flex header variants (tolerate missing punctuation / brackets) --------
+PAT_NAMES_FLEX   = re.compile(r"(?mi)^\s*Name(?:\s*\[\s*s\s*\])?s?\b\s*:?")
+PAT_ROLES_FLEX   = re.compile(r"(?mi)^\s*(?:Role|Position|Job\s*title)(?:\s*\[\s*s\s*\])?s?\b\s*:?")
+PAT_PERIODS_FLEX = re.compile(
+    r"(?mi)^\s*(?:Period|Date|Dates|Employment\s*period)(?:\s*\[\s*s\s*\])?s?"
+    r"(?:\s+(?:employed|of\s*employment|in\s*post))?\b\s*:?"
+)
+
+# Next-section sentinels that terminate the staff block
 NEXT_SECTION_MARKERS = [
-    re.compile(r"^\s*Period\s*when\s*the\s*claimed\s*impact\s*occurred\s*:", re.I | re.M),
-    re.compile(r"^\s*\d+\.\s*Summary\s*of\s*the\s*impact", re.I | re.M),
-    re.compile(r"^\s*\d+\.\s*Underpinning\s*research", re.I | re.M),
-    re.compile(r"^\s*\d+\.\s*References\s*to\s*the\s*research", re.I | re.M),
-    re.compile(r"^\s*\d+\.\s*Details\s*of\s*the\s*impact", re.I | re.M),
+    re.compile(r"(?mi)^\s*Period\s*when\s*the\s*claimed\s*impact\s*occurred(?:\s*[:\-–—])?"),
+    re.compile(r"(?mi)^\s*\d+\.\s*Summary\s*of\s*the\s*impact"),
+    re.compile(r"(?mi)^\s*\d+\.\s*Underpinning\s*research"),
+    re.compile(r"(?mi)^\s*\d+\.\s*References\s*to\s*the\s*research"),
+    re.compile(r"(?mi)^\s*\d+\.\s*Details\s*of\s*the\s*impact"),
+    re.compile(r"(?mi)^\s*Sources\s*to\s*corroborate"),
+    re.compile(r"(?mi)^\s*Further\s*information"),
 ]
 
-def isolate_staff_names_block(text: str) -> Optional[str]:
+def _first_hit(text: str, patterns: List[re.Pattern], pos: int = 0) -> Optional[re.Match]:
+    hits = []
+    for p in patterns:
+        m = p.search(text, pos)
+        if m:
+            hits.append(m)
+    if not hits:
+        return None
+    return min(hits, key=lambda m: m.start())
+
+def _canonicalise_headers(block: str) -> str:
+    """Rewrite header variants to canonical labels for downstream stability."""
+    out = PAT_NAMES_STRICT.sub("Name(s):", block)
+    out = PAT_NAMES_FLEX.sub("Name(s):", out)
+    out = PAT_ROLES_STRICT.sub("Role(s):", out)
+    out = PAT_ROLES_FLEX.sub("Role(s):", out)
+    out = PAT_PERIODS_STRICT.sub("Period(s) employed by submitting HEI:", out)
+    out = PAT_PERIODS_FLEX.sub("Period(s) employed by submitting HEI:", out)
+    return out
+
+def isolate_staff_names_block_with_status(
+    text: Optional[str],
+    service_mode: str = "auto",  # "strict" | "flex" | "auto"
+) -> Tuple[Optional[str], str]:
     """
-    Generalised block extraction:
-    Start the block at the earliest of a line beginning with 'name*:', 'role*:', or 'period*:' (case-insensitive),
-    allowing arbitrary characters between the keyword and the colon. Normalise headings within the block to:
-      - 'Name(s):'
-      - 'Role(s):'
-      - 'Period(s) employed by submitting HEI:'
+    Return (block_text | None, extraction_status) where status ∈ {"strict","flex","none"}.
+    - strict: found using STRICT patterns
+    - flex:   found only via FLEX patterns
+    - none:   not found
     """
+    if not isinstance(text, str) or not text.strip():
+        return None, "none"
+
     txt = _norm_text(text)
     if not txt:
-        return None
+        return None, "none"
 
-    # Find earliest start among the three headings
-    starts = []
-    for pat in (PAT_START_NAME, PAT_START_ROLE, PAT_START_PERIOD):
-        m = pat.search(txt)
-        if m:
-            starts.append(m.start())
-    if not starts:
-        return None
-    start = min(starts)
+    # Choose pattern sets per mode
+    if service_mode == "strict":
+        status_order = ["strict"]
+    elif service_mode == "flex":
+        status_order = ["flex"]
+    else:  # "auto": try strict first, then flex
+        status_order = ["strict", "flex"]
 
-    # Determine end using next-section markers
-    next_hits = [pat.search(txt, pos=start) for pat in NEXT_SECTION_MARKERS]
-    ends = [m.start() for m in next_hits if m]
-    end = min(ends) if ends else len(txt)
+    # Attempt in order
+    for status_label in status_order:
+        if status_label == "strict":
+            start_m = _first_hit(txt, [PAT_NAMES_STRICT]) or _first_hit(txt, [PAT_ROLES_STRICT, PAT_PERIODS_STRICT])
+        else:  # flex
+            start_m = _first_hit(txt, [PAT_NAMES_FLEX]) or _first_hit(txt, [PAT_ROLES_FLEX, PAT_PERIODS_FLEX])
+        if not start_m:
+            continue
 
-    block = txt[start:end].strip()
-    if not block:
-        return None
+        start = start_m.start()
+        next_hits = [pat.search(txt, pos=start) for pat in NEXT_SECTION_MARKERS]
+        ends = [m.start() for m in next_hits if m]
+        end = min(ends) if ends else len(txt)
 
-    # Normalise headings to canonical labels, only when they begin a line
-    def _sub_heading(pattern: re.Pattern, replacement: str, s: str) -> str:
-        return re.sub(pattern, replacement, s)
+        block = txt[start:end].strip()
+        if not block:
+            continue
 
-    block = _sub_heading(PAT_START_NAME,   "Name(s):", block)
-    block = _sub_heading(PAT_START_ROLE,   "Role(s):", block)
-    block = _sub_heading(PAT_START_PERIOD, "Period(s) employed by submitting HEI:", block)
+        block = _canonicalise_headers(block)
 
-    # Also normalise any legacy specific patterns to the canonical labels (idempotent)
-    block = PAT_NAMES.sub("Name(s):", block)
-    block = PAT_ROLES.sub("Role(s):", block)
-    block = PAT_PERIODS.sub("Period(s) employed by submitting HEI:", block)
+        # Collapse wrapped lines within paragraphs but preserve paragraph breaks
+        paras = [
+            RE_MULTI_SPACE.sub(" ", " ".join(p.strip() for p in para.splitlines())).strip()
+            for para in re.split(r"(?:\n\s*){2,}", block)
+        ]
+        out = "\n\n".join(p for p in paras if p)
+        if out.strip():
+            return out, status_label
 
-    paras = [RE_MULTI_SPACE.sub(" ", " ".join(p.strip() for p in para.splitlines())).strip()
-             for para in re.split(r"(?:\n\s*){2,}", block)]
-    block = "\n\n".join(p for p in paras if p)
-    return block or None
+    # Not found
+    return None, "none"
 
 # =========================
 # 3) NAME NORMALISATION
@@ -183,8 +235,10 @@ def extract_given_name(name_no_titles: str) -> str:
         return ""
     toks = re.split(r"[ \-]+", name_no_titles.strip())
     for t in toks:
-        if re.fullmatch(r"[A-Za-z]\.?([A-Za-z]\.)?", t): continue
-        if t.lower() in {"van", "von", "de", "del", "du", "da"}: continue
+        if re.fullmatch(r"[A-Za-z]\.?([A-Za-z]\.)?", t):  # initials
+            continue
+        if t.lower() in {"van", "von", "de", "del", "du", "da"}:
+            continue
         return t
     return toks[0] if toks else ""
 
@@ -193,8 +247,9 @@ def extract_given_name(name_no_titles: str) -> str:
 # =========================
 
 _SYSTEM_MSG = (
-    "You are given REF 'Details of staff' blocks starting at 'Name(s):' and possibly including "
-    "'Role(s):'. The sections are PARALLEL LISTS. "
+    "You are given REF 'Details of staff' blocks whose headers have been canonicalised to "
+    "'Name(s):', 'Role(s):', and 'Period(s) employed by submitting HEI:'. "
+    "The sections are PARALLEL LISTS. "
     "Return JSON {'people': [{'name': ..., 'roles': [...]}]}."
 )
 _STAFF_TOOL = {
@@ -227,10 +282,10 @@ def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str
         return []
     resp = client.chat.completions.create(
         model=model,
-        service_tier="flex",
         messages=[{"role": "system", "content": _SYSTEM_MSG},
                   {"role": "user", "content": block_text}],
         tools=[_STAFF_TOOL],
+        service_tier="flex",
         temperature=0,
     )
     ch = resp.choices[0]
@@ -276,14 +331,23 @@ def get_staff_rows(
     out_dir="../data/ics_staff_rows",
     base_url="https://results2021.ref.ac.uk/impact",
     model_staff="gpt-5",
-    sleep_between_calls=0.03
+    sleep_between_calls=0.03,
+    service_mode: str = "flex"  # "strict" | "flex" | "auto"
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    End-to-end pipeline.
+    Produces:
+      - ../data/ics_staff_rows/ref_text_and_staff_blocks.csv (unified file with Extracted Text + staff_block + extraction_status)
+      - ../data/ics_staff_rows/ref_staff_rows.csv           (flattened people rows from LLM)
+      - ../data/ics_staff_rows/ref_case_level.csv           (aggregated by case; includes staff_block + extraction_status)
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     df_ids = pd.read_csv(input_csv_path)
     ids = df_ids["REF impact case study identifier"].astype(str).tolist()
 
-    all_texts = {}
+    # 1) Download & extract PDFs
+    all_texts: Dict[str, Optional[str]] = {}
     for ics in tqdm(ids, desc="Downloading & extracting PDFs"):
         target = f"{base_url}/{ics}/pdf"
         try:
@@ -294,39 +358,33 @@ def get_staff_rows(
         except Exception:
             all_texts[ics] = None
 
-    df_texts = pd.DataFrame(list(all_texts.items()),
-                            columns=["REF impact case study identifier", "Extracted Text"])
-    df_texts.to_csv(os.path.join(out_dir, "ref_case_studies_text.csv"), index=False)
+    # 2) Build a single master file with extracted text + staff block + extraction status
+    master_rows: List[Tuple[str, Optional[str], Optional[str], str]] = []
+    for ics in tqdm(ids, desc="Isolating staff blocks"):
+        text = all_texts.get(ics)
+        try:
+            blk, status = isolate_staff_names_block_with_status(text, service_mode=service_mode)
+        except Exception:
+            blk, status = None, "none"
+        master_rows.append((ics, text, blk, status))
 
-    # Compute staff blocks for all rows (do NOT drop rows with no block)
-    df_staff_blocks = (
-        df_texts.assign(staff_block=lambda d: d["Extracted Text"].apply(isolate_staff_names_block))
-                .reset_index(drop=True)
+    df_master = pd.DataFrame(
+        master_rows,
+        columns=["REF impact case study identifier", "Extracted Text", "staff_block", "extraction_status"]
     )
-    df_staff_blocks.to_csv(os.path.join(out_dir, "staff_blocks.csv"), index=False)
+    out_master_path = os.path.join(out_dir, "ref_text_and_staff_blocks.csv")
+    df_master.to_csv(out_master_path, index=False)
+
+    # 3) LLM extraction over non-null blocks
+    df_valid_blocks = df_master.dropna(subset=["staff_block"]).reset_index(drop=True)
 
     records: List[Dict[str, Any]] = []
-    # Iterate over ALL rows, writing a row of NaNs if nothing is extracted
-    for _, r in tqdm(df_staff_blocks.iterrows(), total=len(df_staff_blocks), desc="Extracting staff with LLM"):
+    for _, r in tqdm(df_valid_blocks.iterrows(), total=len(df_valid_blocks), desc="Extracting staff with LLM"):
         ics_id, block = r["REF impact case study identifier"], r["staff_block"]
-        people: List[Dict[str, Any]] = []
-        if isinstance(block, str) and block.strip():
-            try:
-                people = parse_staff_with_llm(block, model=model_staff)
-            except Exception as e:
-                people = [{"name": None, "roles": [], "error": str(e)}]
-
-        # If nothing extracted, still write a placeholder row of NaNs to preserve row counts
-        if not people:
-            records.append({
-                "REF impact case study identifier": ics_id,
-                "name": pd.NA,
-                "name_no_titles": pd.NA,
-                "given_name": pd.NA,
-                "role": pd.NA
-            })
-            time.sleep(sleep_between_calls)
-            continue
+        try:
+            people = parse_staff_with_llm(block, model=model_staff)
+        except Exception as e:
+            people = [{"name": None, "roles": [], "error": str(e)}]
 
         for person in people:
             raw_name = (person.get("name") or "").strip()
@@ -336,67 +394,101 @@ def get_staff_rows(
             roles = [x.strip() for x in (person.get("roles") or []) if x.strip()]
             records.append({
                 "REF impact case study identifier": ics_id,
-                "name": name_norm or pd.NA,
-                "name_no_titles": name_no_titles or pd.NA,
-                "given_name": given_name or pd.NA,
-                "role": "; ".join(roles) if roles else pd.NA
+                "name": name_norm or None,
+                "name_no_titles": name_no_titles or None,
+                "given_name": given_name or None,
+                "role": "; ".join(roles) if roles else None
             })
         time.sleep(sleep_between_calls)
 
-    df_staff_rows = pd.DataFrame.from_records(records)
-    df_staff_rows["offline_gender"] = df_staff_rows["given_name"].apply(infer_gender_offline)
+    df_staff_rows = pd.DataFrame.from_records(records, columns=[
+        "REF impact case study identifier", "name", "name_no_titles", "given_name", "role"
+    ])
+    if not df_staff_rows.empty:
+        df_staff_rows["offline_gender"] = df_staff_rows["given_name"].apply(infer_gender_offline)
+    else:
+        df_staff_rows["offline_gender"] = pd.Series(dtype="object")
+
     df_staff_rows.to_csv(os.path.join(out_dir, "ref_staff_rows.csv"), index=False)
 
-    # Aggregate (preserve NaNs; do not fill with empty strings)
-    df = df_staff_rows.copy()
-    grouped = (
-        df.groupby("REF impact case study identifier", dropna=False)
-          .agg(
-              names=("name", list),
-              given_names=("given_name", list),
-              roles=("role", list),
-              genders=("offline_gender", list)
-          )
-    )
-    counts = (
-        df.groupby("REF impact case study identifier", dropna=False)["offline_gender"]
-          .value_counts().unstack(fill_value=0)
-          .rename(columns={
-              "male": "number_male",
-              "female": "number_female",
-              "unknown": "number_unknown"
-          })
-    )
-    # Ensure expected columns exist even if missing in the data
-    for col in ("number_male", "number_female", "number_unknown"):
-        if col not in counts.columns:
-            counts[col] = 0
+    # 4) Aggregate to case-study level with guaranteed columns and full coverage of IDs
+    index_all = pd.Index(ids, name="REF impact case study identifier")
 
-    ref_case_level = grouped.join(counts, how="left").fillna(0).reset_index()
-    ref_case_level["number_people"] = (
-        ref_case_level[["number_male", "number_female", "number_unknown"]].sum(axis=1).astype(int)
+    if df_staff_rows.empty:
+        ref_case_level = pd.DataFrame({
+            "REF impact case study identifier": ids,
+            "names": [[] for _ in ids],
+            "given_names": [[] for _ in ids],
+            "roles": [[] for _ in ids],
+            "genders": [[] for _ in ids],
+            "number_people": 0,
+            "number_male": 0,
+            "number_female": 0,
+            "number_unknown": 0,
+        })
+    else:
+        df = df_staff_rows.copy().fillna("")
+        grouped = (
+            df.groupby("REF impact case study identifier")
+              .agg(
+                  names=("name", list),
+                  given_names=("given_name", list),
+                  roles=("role", list),
+                  genders=("offline_gender", list)
+              )
+              .reindex(index_all)
+        )
+        for col in ["names", "given_names", "roles", "genders"]:
+            grouped[col] = grouped[col].apply(lambda x: x if isinstance(x, list) else [])
+
+        counts_raw = (
+            df.groupby("REF impact case study identifier")["offline_gender"]
+              .value_counts()
+              .unstack(fill_value=0)
+              .reindex(index_all, fill_value=0)
+        )
+        for col in ["male", "female", "unknown"]:
+            if col not in counts_raw.columns:
+                counts_raw[col] = 0
+
+        counts = counts_raw[["male", "female", "unknown"]].rename(columns={
+            "male": "number_male",
+            "female": "number_female",
+            "unknown": "number_unknown"
+        })
+
+        ref_case_level = grouped.join(counts, how="left").reset_index()
+        for c in ["number_male", "number_female", "number_unknown"]:
+            ref_case_level[c] = ref_case_level[c].fillna(0).astype(int)
+        ref_case_level["number_people"] = (
+            ref_case_level[["number_male", "number_female", "number_unknown"]]
+            .sum(axis=1)
+            .astype(int)
+        )
+
+    # --- merge staff_block + extraction_status into final output ---
+    df_master_subset = df_master[["REF impact case study identifier", "staff_block", "extraction_status"]]
+    ref_case_level = (
+        ref_case_level
+        .merge(df_master_subset, on="REF impact case study identifier", how="left")
+        [[
+            "REF impact case study identifier",
+            "staff_block", "extraction_status",
+            "names", "given_names", "roles", "genders",
+            "number_people", "number_male", "number_female", "number_unknown"
+        ]]
     )
-    ref_case_level = ref_case_level[[
-        "REF impact case study identifier",
-        "names", "given_names", "roles", "genders",
-        "number_people", "number_male", "number_female", "number_unknown"
-    ]]
+
     ref_case_level.to_csv(os.path.join(out_dir, "ref_case_level.csv"), index=False)
-
-    # Assert that output row counts align with the original number of rows
-    n_original = len(df_ids)
-    n_unique_staff_rows = df_staff_rows["REF impact case study identifier"].nunique()
-    n_case_level = len(ref_case_level)
-    assert n_unique_staff_rows == n_original, (
-        f"Mismatch: unique staff rows ({n_unique_staff_rows}) != original rows ({n_original})"
-    )
-    assert n_case_level == n_original, (
-        f"Mismatch: aggregated case rows ({n_case_level}) != original rows ({n_original})"
-    )
 
     return df_staff_rows, ref_case_level
 
+# =========================
+# 7) MAIN
+# =========================
+
 if __name__ == "__main__":
-    rows, cases = get_staff_rows()
+    # service_mode: "strict" | "flex" | "auto"
+    rows, cases = get_staff_rows(service_mode="auto")
     print(rows.head())
     print(cases.head())
