@@ -249,7 +249,7 @@ def extract_given_name(name_no_titles: str) -> str:
 _SYSTEM_MSG = (
     "You are given REF 'Details of staff' blocks whose headers have been canonicalised to "
     "'Name(s):', 'Role(s):', and 'Period(s) employed by submitting HEI:'. "
-    "The sections are PARALLEL LISTS. "
+    "The sections are PARALLEL LISTS. We are only interested in extracting author FORENAMES."
     "Return JSON {'people': [{'name': ..., 'roles': [...]}]}."
 )
 _STAFF_TOOL = {
@@ -286,7 +286,7 @@ def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str
                   {"role": "user", "content": block_text}],
         tools=[_STAFF_TOOL],
         service_tier="flex",
-        temperature=0,
+        temperature=1,
     )
     ch = resp.choices[0]
     if getattr(ch.message, "tool_calls", None):
@@ -343,7 +343,7 @@ def get_staff_rows(
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    df_ids = pd.read_csv(input_csv_path)
+    df_ids = pd.read_csv(input_csv_path)[0:150]
     ids = df_ids["REF impact case study identifier"].astype(str).tolist()
 
     # 1) Download & extract PDFs
@@ -384,6 +384,7 @@ def get_staff_rows(
         try:
             people = parse_staff_with_llm(block, model=model_staff)
         except Exception as e:
+            print(e)
             people = [{"name": None, "roles": [], "error": str(e)}]
 
         for person in people:
@@ -394,15 +395,13 @@ def get_staff_rows(
             roles = [x.strip() for x in (person.get("roles") or []) if x.strip()]
             records.append({
                 "REF impact case study identifier": ics_id,
-                "name": name_norm or None,
-                "name_no_titles": name_no_titles or None,
                 "given_name": given_name or None,
                 "role": "; ".join(roles) if roles else None
             })
         time.sleep(sleep_between_calls)
 
     df_staff_rows = pd.DataFrame.from_records(records, columns=[
-        "REF impact case study identifier", "name", "name_no_titles", "given_name", "role"
+        "REF impact case study identifier", "given_name", "role"
     ])
     if not df_staff_rows.empty:
         df_staff_rows["offline_gender"] = df_staff_rows["given_name"].apply(infer_gender_offline)
@@ -417,7 +416,6 @@ def get_staff_rows(
     if df_staff_rows.empty:
         ref_case_level = pd.DataFrame({
             "REF impact case study identifier": ids,
-            "names": [[] for _ in ids],
             "given_names": [[] for _ in ids],
             "roles": [[] for _ in ids],
             "genders": [[] for _ in ids],
@@ -431,14 +429,13 @@ def get_staff_rows(
         grouped = (
             df.groupby("REF impact case study identifier")
               .agg(
-                  names=("name", list),
                   given_names=("given_name", list),
                   roles=("role", list),
                   genders=("offline_gender", list)
               )
               .reindex(index_all)
         )
-        for col in ["names", "given_names", "roles", "genders"]:
+        for col in ["given_names", "roles", "genders"]:
             grouped[col] = grouped[col].apply(lambda x: x if isinstance(x, list) else [])
 
         counts_raw = (
@@ -474,7 +471,7 @@ def get_staff_rows(
         [[
             "REF impact case study identifier",
             "staff_block", "extraction_status",
-            "names", "given_names", "roles", "genders",
+            "given_names", "roles", "genders",
             "number_people", "number_male", "number_female", "number_unknown"
         ]]
     )
