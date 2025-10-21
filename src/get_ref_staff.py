@@ -8,6 +8,7 @@ Requires:
     - pandas, requests, tqdm, pdfminer.six, PyMuPDF (fitz)
     - openai
     - gender-guesser
+    - gender-detector   # added as offline fallback
 """
 
 from __future__ import annotations
@@ -101,7 +102,7 @@ PAT_ROLES_STRICT   = re.compile(
 PAT_PERIODS_STRICT = re.compile(
     rf"(?mi)^\s*(?:Period|Date|Dates|Employment\s*period)(?:\s*\(\s*s\s*\))?s?"
     rf"(?:\s+(?:employed|of\s*employment|in\s*post))?"
-    rf"(?:[^\n]{{0,200}})?\s*{_PUNCT}"
+    rf"(?:[^\n]{0,200})?\s*{_PUNCT}"
 )
 
 # -------- Flex header variants (tolerate missing punctuation / brackets) --------
@@ -277,7 +278,7 @@ _STAFF_TOOL = {
     }
 }
 
-def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str, Any]]:
+def parse_staff_with_llm(block_text: str, model: str = "gpt-4.1") -> List[Dict[str, Any]]:
     if not isinstance(block_text, str) or not block_text.strip():
         return []
     resp = client.chat.completions.create(
@@ -285,7 +286,7 @@ def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str
         messages=[{"role": "system", "content": _SYSTEM_MSG},
                   {"role": "user", "content": block_text}],
         tools=[_STAFF_TOOL],
-        service_tier="flex",
+        service_tier="default",
         temperature=1,
     )
     ch = resp.choices[0]
@@ -302,16 +303,24 @@ def parse_staff_with_llm(block_text: str, model: str = "gpt-5") -> List[Dict[str
         return []
 
 # =========================
-# 5) OFFLINE GENDER
+# 5) OFFLINE GENDER (with fallback)
 # =========================
 
+import functools
 import gender_guesser.detector as gender
 _detector = gender.Detector(case_sensitive=False)
 
-def infer_gender_offline(name: Optional[str]) -> str:
-    if not isinstance(name, str) or not name.strip():
-        return "unknown"
-    result = _detector.get_gender(name.strip().split()[0])
+# Try to import gender-detector as an optional fallback (UK locale for your domain)
+try:
+    from gender_detector.gender_detector import GenderDetector
+    _detector2 = GenderDetector('uk')
+    _has_detector2 = True
+except Exception as e:
+    print(e)
+    _detector2 = None
+    _has_detector2 = False
+
+def _map_gender_guesser(label: Optional[str]) -> str:
     mapping = {
         "male": "male",
         "mostly_male": "male",
@@ -320,7 +329,52 @@ def infer_gender_offline(name: Optional[str]) -> str:
         "andy": "unknown",
         "unknown": "unknown",
     }
-    return mapping.get(result, "unknown")
+    return mapping.get((label or "").strip().lower(), "unknown")
+
+def _map_gender_detector(label: Optional[str]) -> str:
+    if not isinstance(label, str):
+        return "unknown"
+    l = label.strip().lower()
+    if l in {"male", "female"}:
+        return l
+    return "unknown"
+
+@functools.lru_cache(maxsize=8192)
+def infer_gender_offline(name: Optional[str]) -> str:
+    """
+    Deterministic offline gender inference with a strict precedence rule:
+
+        1) gender-guesser (primary)
+        2) gender-detector (secondary; only if primary returns 'unknown' and available)
+
+    Returns one of {'male','female','unknown'}.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return "unknown"
+
+    first = name.strip().split()[0]
+
+    # Primary: gender-guesser
+    gg_raw = _detector.get_gender(first)
+    gg = _map_gender_guesser(gg_raw)
+    if gg != "unknown":
+        return gg
+
+    # Secondary: gender-detector (optional)
+    if _has_detector2:
+        try:
+            # some versions use .guess, others .get_gender
+            if hasattr(_detector2, "guess"):
+                gd_raw = _detector2.guess(first)
+            else:
+                gd_raw = _detector2.get_gender(first)  # type: ignore[attr-defined]
+        except Exception:
+            gd_raw = None
+        gd = _map_gender_detector(gd_raw)
+        if gd != "unknown":
+            return gd
+
+    return "unknown"
 
 # =========================
 # 6) PIPELINE ENTRY POINT
@@ -330,9 +384,9 @@ def get_staff_rows(
     input_csv_path="../data/final/enhanced_ref_data.csv",
     out_dir="../data/ics_staff_rows",
     base_url="https://results2021.ref.ac.uk/impact",
-    model_staff="gpt-5",
+    model_staff="gpt-4.1",
     sleep_between_calls=0.03,
-    service_mode: str = "flex"  # "strict" | "flex" | "auto"
+    service_mode: str = "default"  # "strict" | "flex" | "auto"
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     End-to-end pipeline.
@@ -343,7 +397,7 @@ def get_staff_rows(
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    df_ids = pd.read_csv(input_csv_path)[0:150]
+    df_ids = pd.read_csv(input_csv_path)
     ids = df_ids["REF impact case study identifier"].astype(str).tolist()
 
     # 1) Download & extract PDFs
@@ -487,5 +541,5 @@ def get_staff_rows(
 if __name__ == "__main__":
     # service_mode: "strict" | "flex" | "auto"
     rows, cases = get_staff_rows(service_mode="auto")
-    print(rows.head())
-    print(cases.head())
+    print(len(rows))
+    print(len(cases))
